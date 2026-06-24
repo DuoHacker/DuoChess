@@ -1,7 +1,7 @@
 // ==UserScript==
-// @name         DuoChess Lite
+// @name         Duolingo Chess Solver
 // @namespace    duochess-lite
-// @version      1.0.0
+// @version      1.1
 // @icon         https://i.ibb.co/gZpNbsPP/cosmic.jpg
 // @description  Automaticly solve your Duolingo chess lessons and play chess with Oscar for you.
 // @match        https://www.duolingo.com/*
@@ -14,14 +14,14 @@
 // @license MIT
 // @copyright DuoHacker
 // ==/UserScript==
-
+ 
 /*
 Just a small script for Duolingo Chess. My team and I probably won't update it much, so it might be a little broken lol.
 */
-
+ 
 (() => {
 "use strict";
-
+ 
 const BOT_CFG = {
     engine:          "stockfish",
     jceLevel:        3,
@@ -34,7 +34,7 @@ const BOT_CFG = {
     autoPlay:        true,
     postMoves:       true,
 };
-
+ 
 const SOL_CFG = {
     boardInsetRatio: 64 / 648,
     clickDelay:      180,
@@ -43,10 +43,14 @@ const SOL_CFG = {
     continueDelay:   600,
     autoContinue:    true,
     flipped:         false,
+    turbo:           true,   // skip verify-waits when the move sequence is already known-correct
+    turboPressMs:    60,     // pointerdown→pointerup gap — below ~50ms Duolingo's board often drops the click
+    turboClickGap:   60,     // gap between "from" click and "to" click — needs time to register piece selection
+    turboSettleMs:   90,     // settle after a confirmed player move before next click
 };
-
+ 
 const STORE_KEY = "duochess.v1.settings";
-
+ 
 function loadSettings(){
     try{
         const saved=JSON.parse(localStorage.getItem(STORE_KEY)||"{}");
@@ -64,17 +68,17 @@ function saveSettings(){
     try{ localStorage.setItem(STORE_KEY,JSON.stringify({bot:BOT_CFG,solver:SOL_CFG})); }catch(_){}
 }
 loadSettings();
-
+ 
 // ══════════════════════════════════════════════════════════════════════════════
 //  UTILS
 // ══════════════════════════════════════════════════════════════════════════════
-
+ 
 const sleep    = ms => new Promise(r => setTimeout(r, ms));
 const UCI_RE   = /^[a-h][1-8][a-h][1-8][qrbn]?$/;
 const validUCI = s => typeof s === "string" && UCI_RE.test(s.trim());
 const toUCI    = s => String(s).trim().split(/\s+/).filter(validUCI);
 const esc      = s => String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
-
+ 
 async function boardStabilize(timeout = 3000, stableMs = 120, sampleInterval = 80) {
     const canvas = findCanvas();
     if (!canvas) { await sleep(stableMs); return; }
@@ -98,11 +102,11 @@ async function boardStabilize(timeout = 3000, stableMs = 120, sampleInterval = 8
         else if (Date.now() - stableSince >= stableMs) return;
     }
 }
-
+ 
 // ══════════════════════════════════════════════════════════════════════════════
 //  STATE
 // ══════════════════════════════════════════════════════════════════════════════
-
+ 
 const BOT_S = {
     matchId: null, playerColor: null,
     currentFen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
@@ -111,34 +115,51 @@ const BOT_S = {
     stockfish: null, stockfishReady: false,
     engineName: "none", lastMove: null,
 };
-
+ 
 const SOL_STATE = {
     raw: null, challenges: [], currentIdx: 0, solving: false, log: [],
 };
-
+ 
 // ══════════════════════════════════════════════════════════════════════════════
 //  CANVAS & CLICK
 // ══════════════════════════════════════════════════════════════════════════════
-
+ 
+let _canvasCache = { el: null, t: 0 };
+ 
 function findCanvas() {
-    return [...document.querySelectorAll("canvas")]
+    // Short-lived cache: avoids re-scanning the whole DOM on every snap/click
+    // call when several happen back-to-back within the same animation frame.
+    const now = Date.now();
+    if (_canvasCache.el && _canvasCache.el.isConnected && (now - _canvasCache.t) < 150) {
+        return _canvasCache.el;
+    }
+    const candidates = [...document.querySelectorAll("canvas")]
         .filter(c => {
             if (!c.isConnected) return false;
             const r = c.getBoundingClientRect();
-            return r.width > 200 && r.height > 200 && Math.abs(r.width/r.height - 1) < 0.2;
+            if (!(r.width > 200 && r.height > 200 && Math.abs(r.width/r.height - 1) < 0.2)) return false;
+            // Decorative overlay canvases (confetti/particles/celebration effects)
+            // are typically non-interactive — skip them so we don't grab the
+            // wrong layer when several square canvases are stacked.
+            const cs = getComputedStyle(c);
+            if (cs.pointerEvents === "none") return false;
+            return true;
         })
         .sort((a,b) => {
             const ra=a.getBoundingClientRect(),rb=b.getBoundingClientRect();
             return (rb.width*rb.height)-(ra.width*ra.height);
-        })[0] ?? null;
+        });
+    const picked = candidates[0] ?? null;
+    _canvasCache = { el: picked, t: now };
+    return picked;
 }
-
+ 
 async function waitCanvas(timeout=10000) {
     const t0=Date.now();
     while(Date.now()-t0<timeout){ const c=findCanvas(); if(c) return c; await sleep(50); }
     throw new Error("Canvas not found");
 }
-
+ 
 function firePointer(el,type,x,y,buttons) {
     if(typeof PointerEvent==="function")
         el.dispatchEvent(new PointerEvent(type,{bubbles:true,cancelable:true,composed:true,clientX:x,clientY:y,button:0,buttons,pointerId:1,pointerType:"mouse",isPrimary:true,view:window}));
@@ -146,8 +167,8 @@ function firePointer(el,type,x,y,buttons) {
 function fireMouse(el,type,x,y,buttons) {
     el.dispatchEvent(new MouseEvent(type,{bubbles:true,cancelable:true,composed:true,clientX:x,clientY:y,button:0,buttons,view:window}));
 }
-
-async function clickSquare(sq,insetRatio,flipped) {
+ 
+async function clickSquare(sq,insetRatio,flipped,pressMs=70) {
     const canvas=await waitCanvas();
     function coords(r) {
         const iw=r.width*insetRatio,ih=r.height*insetRatio;
@@ -158,12 +179,12 @@ async function clickSquare(sq,insetRatio,flipped) {
     }
     const d=coords(canvas.getBoundingClientRect());
     firePointer(canvas,"pointerdown",d.x,d.y,1); fireMouse(canvas,"mousedown",d.x,d.y,1);
-    await sleep(70);
+    await sleep(pressMs);
     const u=coords(canvas.getBoundingClientRect());
     firePointer(canvas,"pointerup",u.x,u.y,0); fireMouse(canvas,"mouseup",u.x,u.y,0); fireMouse(canvas,"click",u.x,u.y,0);
 }
 let _Chess = null;
-
+ 
 async function loadChessJS(){
     try{
         const mod=await import("https://esm.sh/chess.js@1.3.0");
@@ -173,7 +194,7 @@ async function loadChessJS(){
         renderPanel();
     }catch(e){addLog("sys","chess.js failed");}
 }
-
+ 
 async function loadJCE(){
     try{
         addLog("sys","Loading js-chess-engine...");
@@ -188,14 +209,14 @@ async function loadJCE(){
         renderPanel();
     }
 }
-
+ 
 // ══════════════════════════════════════════════════════════════════════════════
 //  ENGINE — Stockfish (stockfish.online REST API)
 //  API: GET https://stockfish.online/api/s/v2.php?fen=<FEN>&depth=<N>&mode=bestmove
 //  Returns JSON: { success: true, bestmove: "e2e4 ponder d7d5", ... }
 //  Logo: https://stockfishchess.org/images/logo/icon_512x512@2x.webp
 // ══════════════════════════════════════════════════════════════════════════════
-
+ 
 async function loadStockfish(){
     addLog("sys","Checking stockfish.online API...");
     try{
@@ -218,7 +239,7 @@ async function loadStockfish(){
         return false;
     }
 }
-
+ 
 async function stockfishBestMove(fen, depth){
     if(!BOT_S.stockfishReady) return null;
     try{
@@ -238,11 +259,11 @@ async function stockfishBestMove(fen, depth){
         return null;
     }
 }
-
+ 
 // ══════════════════════════════════════════════════════════════════════════════
 //  ENGINE — DISPATCH
 // ══════════════════════════════════════════════════════════════════════════════
-
+ 
 function activeEngineName(){
     const e=BOT_CFG.engine;
     if(e==="stockfish"&&BOT_S.stockfishReady) return "Stockfish";
@@ -252,10 +273,10 @@ function activeEngineName(){
     if(BOT_S.jceReady)       return "js-chess-engine";
     return "none";
 }
-
+ 
 async function getBestMove(fen){
     const e=BOT_CFG.engine;
-
+ 
     // Stockfish (primary or fallback)
     if(BOT_S.stockfishReady&&(e==="stockfish"||e!=="jce")){
         try{
@@ -263,7 +284,7 @@ async function getBestMove(fen){
             if(mv){ BOT_S.engineName="Stockfish"; return mv; }
         }catch(_){}
     }
-
+ 
     // JCE (primary or fallback)
     if(BOT_S.jceReady&&BOT_S.jce&&(e==="jce"||e!=="stockfish")){
         try{
@@ -275,7 +296,7 @@ async function getBestMove(fen){
             return uci;
         }catch(_){}
     }
-
+ 
     // Last resort: random via chess.js
     if(_Chess){
         try{
@@ -287,21 +308,21 @@ async function getBestMove(fen){
             }
         }catch(_){}
     }
-
+ 
     return null;
 }
-
+ 
 // ══════════════════════════════════════════════════════════════════════════════
 //  BOT LOGIC
 // ══════════════════════════════════════════════════════════════════════════════
-
+ 
 const MATCHES_RE=/\/chess\/\d+\/\d+\/matches(?:\/([^/?#]+))?/;
 const MOVES_RE=/\/chess\/\d+\/\d+\/matches\/[^/?#]+\/moves/;
 const isMatchURL=url=>MATCHES_RE.test(url)&&!MOVES_RE.test(url);
 const isSessionURL=url=>typeof url==="string"&&/\/sessions(?:[/?#]|$)/i.test(url);
 const fenSide=fen=>fen?.split(" ")?.[1]??"w";
 function isOurTurn(fen){if(!BOT_S.playerColor||!BOT_S.matchId)return false;const s=fenSide(fen);return(s==="w"&&BOT_S.playerColor==="white")||(s==="b"&&BOT_S.playerColor==="black");}
-
+ 
 function onMatchData(data){
     if(!data) return;
     const match=data.match??(data.boardFen?data:null);
@@ -318,7 +339,7 @@ function onMatchData(data){
     } else BOT_S.status="waiting";
     renderPanel();
 }
-
+ 
 async function waitCanvasChange(baseline, timeout=1200, interval=40){
     const canvas=findCanvas();
     if(!canvas||baseline===null) { await sleep(120); return; }
@@ -335,7 +356,7 @@ async function waitCanvasChange(baseline, timeout=1200, interval=40){
         }catch(_){ return; }
     }
 }
-
+ 
 function canvasHash(){
     const canvas=findCanvas();
     if(!canvas) return null;
@@ -348,12 +369,34 @@ function canvasHash(){
         return s;
     }catch(_){ return null; }
 }
-
+ 
 async function takeTurn(){
     if(BOT_S.status==="thinking"||BOT_S.status==="playing") return;
     BOT_S.status="thinking"; renderPanel();
-    const move=await getBestMove(BOT_S.currentFen);
+ 
+    let move=null, fenUsed=null;
+    let attempts=0;
+    while(attempts++<2){
+        fenUsed=BOT_S.currentFen;                 // snapshot the FEN we're thinking against
+        move=await getBestMove(fenUsed);
+        if(!move){BOT_S.status="idle";renderPanel();return;}
+        // If the board changed while we were waiting on the engine (poll loop /
+        // websocket pushed a new boardFen), the move we just computed may no
+        // longer be legal — validate against the FEN we're about to act on.
+        if(fenUsed===BOT_S.currentFen) break;       // board didn't move, safe to use
+        if(_Chess){
+            try{
+                const c=new _Chess(BOT_S.currentFen);
+                const ok=c.moves({verbose:true}).some(m=>m.from+m.to+(m.promotion??"")===move);
+                if(ok) break;                       // still legal on the latest board, use it
+            }catch(_){}
+        }
+        // not safe — loop once more and recompute against the latest FEN
+        addLog("bot","board changed mid-think, recomputing");
+        move=null;
+    }
     if(!move){BOT_S.status="idle";renderPanel();return;}
+ 
     BOT_S.status="playing"; BOT_S.lastMove=move; renderPanel();
     try{
         const flip=BOT_CFG.flipped||BOT_S.playerColor==="black";
@@ -374,7 +417,7 @@ async function takeTurn(){
     } catch(e){addLog("bot","err: "+e.message);BOT_S.status="idle";}
     renderPanel();
 }
-
+ 
 async function postMove(uci){
     const uid=location.pathname.match(/\/(\d+)\//)?.[1]??"0";
     const hdrs={"Content-Type":"application/json"};
@@ -386,11 +429,11 @@ async function postMove(uci){
         if(m?.boardFen&&isOurTurn(m.boardFen)&&BOT_CFG.autoPlay) setTimeout(takeTurn,BOT_CFG.thinkDelay+BOT_CFG.moveDelay);
     } catch(_){}
 }
-
+ 
 // ══════════════════════════════════════════════════════════════════════════════
 //  SOLVER
 // ══════════════════════════════════════════════════════════════════════════════
-
+ 
 function _sanitizeDuoFen(fen){
     const parts=fen.split(" ");
     const rows=parts[0].split("/");
@@ -412,13 +455,13 @@ function _sanitizeDuoFen(fen){
     }
     return parts.join(" ");
 }
-
+ 
 function _forceWhite(fen){
     const p=fen.split(" ");
     p[1]="w"; p[2]="-"; p[3]="-";
     return p.join(" ");
 }
-
+ 
 function starCaptureAdapter(fen, seedMoves, maxMoves){
     if(!_Chess) return null;
     try{
@@ -451,12 +494,12 @@ function starCaptureAdapter(fen, seedMoves, maxMoves){
         return steps.length>0 ? steps : null;
     }catch(_){ return null; }
 }
-
+ 
 function countBlackPieces(fen){
     const board=fen.split(" ")[0];
     return(board.match(/p/g)??[]).length;
 }
-
+ 
 function buildSequence(info, fen){
     const correct=(info.correctMoves??[]).flatMap(toUCI);
     const enemy=(info.enemyMoves??[]).flatMap(toUCI);
@@ -465,7 +508,7 @@ function buildSequence(info, fen){
     const maxMoves=info.maxMoves??undefined;
     const hasEnemy=enemy.length>0;
     const starCount=fen?countBlackPieces(fen):0;
-
+ 
     if(correct.length>0){
         const steps=correct.map(m=>({kind:"player",move:m}));
         if(hasEnemy){
@@ -498,12 +541,12 @@ function buildSequence(info, fen){
     if(evalSteps.length>0) return{source:"evalFallback",steps:evalSteps,allPaths:[]};
     return{source:"none",steps:[],allPaths:[]};
 }
-
+ 
 function parseChallenge(raw,idx){
     const p=buildSequence(raw?.chessPuzzleInfo??{}, raw?.fen??"");
     return{idx,id:raw.id??`ch_${idx}`,fen:raw.fen??"",source:p.source,steps:p.steps,allPaths:p.allPaths,raw};
 }
-
+ 
 function reparseChallenges(){
     if(!SOL_STATE.raw||!SOL_STATE.challenges.length) return;
     const prevIdx=SOL_STATE.currentIdx;
@@ -512,7 +555,7 @@ function reparseChallenges(){
     addLog("solver","Re-parsed with StarAdapter: "+SOL_STATE.challenges.length+" challenges");
     renderPanel();
 }
-
+ 
 function processSession(session){
     if(!Array.isArray(session?.challenges)) return;
     SOL_STATE.raw=session; SOL_STATE.currentIdx=0;
@@ -520,7 +563,7 @@ function processSession(session){
     addLog("solver",`Session loaded: ${SOL_STATE.challenges.length} challenges`);
     renderPanel();
 }
-
+ 
 async function clickContinue(){
     const t0=Date.now();
     while(Date.now()-t0<6000){
@@ -531,25 +574,25 @@ async function clickContinue(){
     }
     return false;
 }
-
+ 
 // Fast canvas-change detector: returns as soon as hash differs from baseline, or timeout
 async function _waitBoardChange(baseline, timeout=1500, interval=20){
     const canvas=findCanvas();
     if(!canvas||baseline===null){await sleep(60);return;}
     const ctx=canvas.getContext("2d");
     if(!ctx){await sleep(60);return;}
-    const w=Math.min(canvas.width,64),h=Math.min(canvas.height,64);
+    const w=Math.min(canvas.width,32),h=Math.min(canvas.height,32);
     const t0=Date.now();
     while(Date.now()-t0<timeout){
         await sleep(interval);
         try{
             const d=ctx.getImageData(0,0,w,h).data;
-            let s=0;for(let i=0;i<d.length;i+=16)s=(s*31+d[i]+d[i+1]+d[i+2])|0;
-            if(s!==baseline)return;
+            let s=0;for(let i=0;i<d.length;i+=8)s=(s*31+d[i]+d[i+1]+d[i+2])|0;
+            if(s!==baseline){ _canvasCache.t=0; return; }
         }catch(_){return;}
     }
 }
-
+ 
 // Fast canvas hash snapshot
 function _canvasSnap(){
     const canvas=findCanvas();
@@ -557,65 +600,78 @@ function _canvasSnap(){
     try{
         const ctx=canvas.getContext("2d");
         if(!ctx)return null;
-        const w=Math.min(canvas.width,64),h=Math.min(canvas.height,64);
+        const w=Math.min(canvas.width,32),h=Math.min(canvas.height,32);
         const d=ctx.getImageData(0,0,w,h).data;
-        let s=0;for(let i=0;i<d.length;i+=16)s=(s*31+d[i]+d[i+1]+d[i+2])|0;
+        let s=0;for(let i=0;i<d.length;i+=8)s=(s*31+d[i]+d[i+1]+d[i+2])|0;
         return s;
     }catch(_){return null;}
 }
-
+ 
 async function solveChallenge(ch){
     if(!ch.steps.length){addLog("solver",`#${ch.idx} no steps (${ch.source})`);return;}
-    addLog("solver",`Solving #${ch.idx} [${ch.source}]`);
+    addLog("solver",`Solving #${ch.idx} [${ch.source}]${SOL_CFG.turbo?" ⚡turbo":""}`);
     for(const step of ch.steps){
         renderPanel();
         if(step.kind==="player"){
             if(!validUCI(step.move)) throw new Error("Invalid UCI: "+step.move);
             addLog("solver",`Move: ${step.move}`);
-
-            const h0=_canvasSnap();
-            await clickSquare(step.move.slice(0,2),SOL_CFG.boardInsetRatio,SOL_CFG.flipped);
-            await sleep(SOL_CFG.clickDelay);   // gap between from→to click
-            await clickSquare(step.move.slice(2,4),SOL_CFG.boardInsetRatio,SOL_CFG.flipped);
-
-            // Wait for board to actually change (our piece moved), then a short settle
-            await _waitBoardChange(h0, 1500, 20);
-            await sleep(SOL_CFG.moveDelay);    // let animation finish
-
+ 
+            if(SOL_CFG.turbo){
+                // Known-correct move from puzzle data — no need to wait for canvas
+                // confirmation, just give Duolingo's click handler enough time to
+                // register each press before firing the next one.
+                await clickSquare(step.move.slice(0,2),SOL_CFG.boardInsetRatio,SOL_CFG.flipped,SOL_CFG.turboPressMs);
+                await sleep(SOL_CFG.turboClickGap);
+                await clickSquare(step.move.slice(2,4),SOL_CFG.boardInsetRatio,SOL_CFG.flipped,SOL_CFG.turboPressMs);
+                await sleep(SOL_CFG.turboSettleMs);
+            } else {
+                const h0=_canvasSnap();
+                await clickSquare(step.move.slice(0,2),SOL_CFG.boardInsetRatio,SOL_CFG.flipped);
+                await sleep(SOL_CFG.clickDelay);   // gap between from→to click
+                await clickSquare(step.move.slice(2,4),SOL_CFG.boardInsetRatio,SOL_CFG.flipped);
+ 
+                // Wait for board to actually change (our piece moved), then a short settle
+                await _waitBoardChange(h0, 1500, 20);
+                await sleep(SOL_CFG.moveDelay);    // let animation finish
+            }
+ 
         } else {
-            // Enemy move: just poll until board changes — no fixed sleep
+            // Enemy move: outcome isn't known in advance (server/engine decides),
+            // so always poll for an actual board change — turbo just polls faster.
             addLog("solver",`Waiting enemy: ${step.move}`);
             const h1=_canvasSnap();
-            await _waitBoardChange(h1, SOL_CFG.enemyDelay + 800, 20);
-            await sleep(80); // tiny settle after enemy animation
+            const interval=SOL_CFG.turbo?10:20;
+            const timeout=SOL_CFG.turbo?SOL_CFG.enemyDelay:(SOL_CFG.enemyDelay+800);
+            await _waitBoardChange(h1, timeout, interval);
+            await sleep(SOL_CFG.turbo?30:80); // tiny settle after enemy animation
         }
     }
     addLog("solver",`#${ch.idx} complete`);
-    if(SOL_CFG.autoContinue){await sleep(SOL_CFG.continueDelay);await clickContinue();}
+    if(SOL_CFG.autoContinue){await sleep(SOL_CFG.turbo?Math.min(150,SOL_CFG.continueDelay):SOL_CFG.continueDelay);await clickContinue();}
 }
-
+ 
 async function solve(idx=SOL_STATE.currentIdx){
     if(SOL_STATE.solving) throw new Error("Already solving");
     const ch=SOL_STATE.challenges[idx];if(!ch) throw new Error("No challenge at "+idx);
     SOL_STATE.solving=true;try{await solveChallenge(ch);}finally{SOL_STATE.solving=false;renderPanel();}
 }
-
+ 
 async function solveNext(){
     if(!SOL_STATE.challenges.length) throw new Error("No session loaded");
     if(SOL_STATE.currentIdx>=SOL_STATE.challenges.length){addLog("solver","All done");return;}
     await solve(SOL_STATE.currentIdx);SOL_STATE.currentIdx++;renderPanel();
 }
-
+ 
 async function solveAll(){
     if(SOL_STATE.solving) throw new Error("Already solving");
     while(SOL_STATE.currentIdx<SOL_STATE.challenges.length){await solveNext();await sleep(200);}
     addLog("solver","All challenges complete");renderPanel();
 }
-
+ 
 // ══════════════════════════════════════════════════════════════════════════════
 //  NETWORK HOOKS
 // ══════════════════════════════════════════════════════════════════════════════
-
+ 
 let _lastSessionUrl = null;
 const _origFetch=window.fetch;
 window.fetch=async function(...args){
@@ -637,29 +693,29 @@ XMLHttpRequest.prototype.send=function(...args){
     }
     return _xSend.apply(this,args);
 };
-
+ 
 // ══════════════════════════════════════════════════════════════════════════════
 //  LOG
 // ══════════════════════════════════════════════════════════════════════════════
-
+ 
 function addLog(source,msg){
     SOL_STATE.log.push({source,msg,time:new Date().toLocaleTimeString("vi-VN",{hour:"2-digit",minute:"2-digit",second:"2-digit"})});
     if(SOL_STATE.log.length>120) SOL_STATE.log.shift();
     renderPanel();
 }
-
+ 
 // ══════════════════════════════════════════════════════════════════════════════
-
-
-
-
+ 
+ 
+ 
+ 
 // ── Chủ động fetch /sessions từ URL hiện tại ──
 async function _fetchSession() {
     let sessionUrl = null;
-
+ 
     // 1. Dùng URL đã cache từ hook (reliable nhất)
     if (_lastSessionUrl) sessionUrl = _lastSessionUrl;
-
+ 
     // 2. Scan performance entries (chỉ có sau khi page load xong)
     if (!sessionUrl) {
         try {
@@ -669,7 +725,7 @@ async function _fetchSession() {
             if (hit) sessionUrl = hit.name;
         } catch (_) {}
     }
-
+ 
     if (!sessionUrl) {
         const date = new Date().toISOString().slice(0, 10);
         const candidates = [
@@ -686,12 +742,12 @@ async function _fetchSession() {
             } catch (_) {}
         }
     }
-
+ 
     if (!sessionUrl) {
         addLog("solver", "[fetch] /sessions URL not found — navigate to a chess lesson first");
         return false;
     }
-
+ 
     try {
         const hdrs = {};
         if (BOT_S.authToken) hdrs["Authorization"] = BOT_S.authToken;
@@ -705,10 +761,10 @@ async function _fetchSession() {
         return false;
     }
 }
-
+ 
 //  SVG ICONS
     // ══════════════════════════════════════════════════════════════════════════════
-
+ 
     const ICONS = {
         play: `<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><path d="M4 3l10 5-10 5V3z" fill="currentColor"/></svg>`,
         pause: `<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="3" y="2" width="4" height="12" rx="1" fill="currentColor"/><rect x="9" y="2" width="4" height="12" rx="1" fill="currentColor"/></svg>`,
@@ -758,11 +814,11 @@ async function _fetchSession() {
         cpu: `<svg width="14" height="14" viewBox="0 0 16 16" fill="none"><rect x="3" y="3" width="10" height="10" rx="1.5" stroke="currentColor" stroke-width="1.5"/><rect x="5.5" y="5.5" width="5" height="5" rx="0.5" fill="currentColor"/><path d="M5 1v2M8 1v2M11 1v2M5 13v2M8 13v2M11 13v2M1 5h2M1 8h2M1 11h2M13 5h2M13 8h2M13 11h2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg>`,
         dot: `<svg width="8" height="8" viewBox="0 0 8 8"><circle cx="4" cy="4" r="4" fill="currentColor"/></svg>`,
     };
-
+ 
     // ══════════════════════════════════════════════════════════════════════════════
     //  STYLES  (Duolingo × Apple)
     // ══════════════════════════════════════════════════════════════════════════════
-
+ 
     const STYLE = `
 @font-face {
     font-family: "SF Pro Rounded";
@@ -789,9 +845,9 @@ async function _fetchSession() {
     src: url("https://font.duohacker.io.vn/SF-Pro-Rounded-Black.otf") format("opentype");
     font-weight: 900; font-display: swap;
 }
-
+ 
 #dc-panel,#dc-panel*{box-sizing:border-box;margin:0;padding:0;}
-
+ 
 /* ── DESIGN TOKENS (DuoRain-style CSS vars) ── */
 #dc-panel{
     --glass: blur(26px) saturate(140%);
@@ -825,7 +881,7 @@ async function _fetchSession() {
     --muted:    rgba(0,0,0,0.22);
     --dropdown: rgba(230,234,248,0.98);
 }
-
+ 
 /* ── PANEL ── */
 #dc-panel{
     position:fixed;bottom:24px;right:24px;
@@ -847,9 +903,9 @@ async function _fetchSession() {
 }
 #dc-panel * { font-family: 'SF Pro Rounded','Nunito', system-ui, sans-serif; }
 #dc-panel.dc-hidden{opacity:0;pointer-events:none;transform:translateY(10px) scale(0.97);filter:blur(3px);}
-
-
-
+ 
+ 
+ 
 /* ── TITLE BAR ── */
 #dc-bar{
     display:flex;align-items:center;padding:0 14px;
@@ -889,7 +945,7 @@ async function _fetchSession() {
 }
 .dc-winbtn:hover{background:rgba(255,255,255,0.1);color:#fff;border-color:rgba(255,255,255,0.18);}
 .dc-winbtn:active{transform:scale(0.88);}
-
+ 
 /* ── TAB BAR ── */
 #dc-tabs{
     display:flex;flex-shrink:0;
@@ -912,7 +968,7 @@ async function _fetchSession() {
 .dc-tab svg{flex-shrink:0;}
 .dc-tab:hover{color:rgba(255,255,255,0.65);background:rgba(255,255,255,0.04);}
 .dc-tab.on{color:#78e000;border-bottom-color:#78e000;background:rgba(88,204,2,0.05);}
-
+ 
 /* ── PANE ── */
 #dc-pane{
     overflow-y:auto;overflow-x:hidden;
@@ -925,12 +981,12 @@ async function _fetchSession() {
 #dc-pane::-webkit-scrollbar-thumb:hover{background:linear-gradient(180deg,rgba(120,224,0,0.8) 0%,rgba(88,204,2,0.45) 100%);}
 #dc-pane::-webkit-scrollbar-thumb:active{background:rgba(120,224,0,0.9);}
 #dc-pane{scrollbar-width:thin;scrollbar-color:rgba(88,204,2,0.35) rgba(255,255,255,0.03);}
-
+ 
 .dc-section-label{
     font-size:10px;font-weight:800;letter-spacing:0.12em;
     text-transform:uppercase;color:rgba(255,255,255,0.2);padding:0 2px;
 }
-
+ 
 /* ── CARD ── */
 .dc-card{
     background:rgba(255,255,255,0.035);
@@ -942,7 +998,7 @@ async function _fetchSession() {
 .dc-card>.dc-kv-grid{border-radius:13px;}
 .dc-card>.dc-ch-list .dc-ch-item:first-child{border-radius:13px 13px 0 0;}
 .dc-card>.dc-ch-list .dc-ch-item:last-child{border-radius:0 0 13px 13px;}
-
+ 
 /* ── BUTTONS ── */
 .dc-btn-row{display:flex;gap:7px;padding:10px;flex-wrap:wrap;}
 .btn{
@@ -965,7 +1021,7 @@ async function _fetchSession() {
 #dc-panel .btn.ghost:hover{background:rgba(255,255,255,0.09) !important;border-color:rgba(255,255,255,0.18) !important;color:#e2e4f0 !important;}
 #dc-panel .btn.ghost.on{border-color:rgba(120,224,0,0.35) !important;color:#78e000 !important;background:rgba(88,204,2,0.07) !important;}
 #dc-panel .btn.fill{flex:1;}
-
+ 
 /* ── STATUS BAR ── */
 .dc-status-bar{
     display:flex;align-items:center;gap:8px;
@@ -985,7 +1041,7 @@ async function _fetchSession() {
 @keyframes dc-pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.45;transform:scale(.8)}}
 .dc-status-txt{flex:1;font-family:'SF Pro Rounded','Nunito',system-ui,sans-serif;font-size:10px;color:rgba(255,255,255,0.25);}
 .dc-status-move{font-family:'SF Pro Rounded','Nunito',system-ui,sans-serif;font-weight:600;color:#78e000;font-size:11px;}
-
+ 
 /* ── KV GRID ── */
 .dc-kv-grid{display:grid;grid-template-columns:1fr 1fr;gap:1px;background:rgba(255,255,255,0.05);}
 .dc-kv-cell{background:rgba(22,23,30,0.95);padding:10px 12px;display:flex;flex-direction:column;gap:3px;}
@@ -994,14 +1050,14 @@ async function _fetchSession() {
 .dc-kv-value.accent{color:#78e000;}
 .dc-kv-value.yellow{color:#ffd900;}
 .dc-kv-value.dim   {color:rgba(255,255,255,0.18);}
-
+ 
 /* ── FEN ── */
 .dc-fen{
     font-family:'SF Pro Rounded','Nunito',system-ui,sans-serif;font-size:9px;
     color:rgba(255,255,255,0.15);word-break:break-all;line-height:1.8;
     padding:8px 12px;background:rgba(0,0,0,0.12);border-top:1px solid rgba(255,255,255,0.05);
 }
-
+ 
 /* ── CHALLENGES ── */
 .dc-ch-list{display:flex;flex-direction:column;}
 .dc-ch-item{
@@ -1027,7 +1083,7 @@ async function _fetchSession() {
 .dc-ch-moves{font-family:'SF Pro Rounded','Nunito',system-ui,sans-serif;font-size:10px;color:rgba(255,255,255,0.25);line-height:1.6;}
 .dc-ch-moves .mv-player{color:#78e000;}
 .dc-ch-moves .mv-enemy {color:#ff6060;}
-
+ 
 /* ── SETTINGS ── */
 .dc-setting-row{
     display:flex;align-items:center;justify-content:space-between;gap:10px;
@@ -1036,7 +1092,7 @@ async function _fetchSession() {
 .dc-setting-row:last-child{border-bottom:none;}
 .dc-setting-label{font-size:12px;color:rgba(255,255,255,0.65);font-weight:700;}
 .dc-setting-desc{font-size:10px;color:rgba(255,255,255,0.18);margin-top:1px;}
-
+ 
 /* ── TOGGLE SWITCH ── */
 .dc-sw{position:relative;width:38px;height:22px;cursor:pointer;flex-shrink:0;}
 .dc-sw input{opacity:0;width:0;height:0;position:absolute;}
@@ -1044,7 +1100,7 @@ async function _fetchSession() {
 .dc-sw input:checked~.dc-sw-t{background:#58cc02;border-color:#78e000;box-shadow:0 0 8px rgba(88,204,2,0.35);}
 .dc-sw-k{position:absolute;top:3px;left:3px;width:16px;height:16px;border-radius:50%;background:rgba(255,255,255,0.45);transition:transform .16s cubic-bezier(.34,1.56,.64,1),background .16s;box-shadow:0 1px 3px rgba(0,0,0,0.3);}
 .dc-sw input:checked~.dc-sw-t~.dc-sw-k{transform:translateX(16px);background:#fff;}
-
+ 
 /* ── STEPPER ── */
 .dc-stepper{display:flex;align-items:center;gap:5px;}
 .dc-stepper button{
@@ -1057,7 +1113,7 @@ async function _fetchSession() {
 .dc-stepper button:hover{background:rgba(255,255,255,0.11);color:#fff;border-color:rgba(255,255,255,0.22);}
 .dc-stepper button:active{transform:scale(0.9);}
 .dc-stepper-val{min-width:34px;text-align:center;font-family:'SF Pro Rounded','Nunito',system-ui,sans-serif;font-size:13px;font-weight:600;color:#d8dae8;}
-
+ 
 /* ── ENGINE SELECTOR ── */
 .dc-eng-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:6px;padding:10px;}
 .dc-eng-btn{
@@ -1083,7 +1139,7 @@ async function _fetchSession() {
     background:rgba(255,255,255,0.1);
 }
 .dc-eng-badge.ready{background:#78e000;box-shadow:0 0 5px rgba(120,224,0,0.5);}
-
+ 
 /* ── LOG ── */
 .dc-log-entry{
     display:flex;gap:8px;align-items:baseline;
@@ -1097,17 +1153,17 @@ async function _fetchSession() {
 .dc-log-src.bot   {color:#78e000;}
 .dc-log-src.solver{color:#a855f7;}
 .dc-log-msg{color:rgba(255,255,255,0.3);flex:1;word-break:break-all;}
-
+ 
 /* ── EMPTY ── */
 .dc-empty{
     text-align:center;color:rgba(255,255,255,0.16);font-size:12px;
     padding:28px 16px;line-height:2;font-family:'SF Pro Rounded','Nunito',sans-serif;font-weight:700;
 }
-
+ 
 /* ── PROGRESS ── */
 .dc-prog-wrap{height:3px;background:rgba(255,255,255,0.05);}
 .dc-prog-bar{height:3px;background:linear-gradient(90deg,#58cc02,#78e000);transition:width .4s cubic-bezier(.4,0,.2,1);}
-
+ 
 /* ── HUB HEADER ── */
 .dc-hub-hd{
     padding:14px 14px 10px;
@@ -1116,23 +1172,23 @@ async function _fetchSession() {
 .dc-hub-label{font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:rgba(255,255,255,0.2);}
 .dc-hub-title{font-size:20px;font-weight:900;color:#e2e4f0;margin-top:2px;font-family:'SF Pro Rounded','Nunito',sans-serif;letter-spacing:-.02em;}
 .dc-hub-title span{color:#78e000;}
-
+ 
 /* ── DIV ── */
 .dc-divider{height:1px;background:rgba(255,255,255,0.05);margin:0 12px;}
-
+ 
 @media(max-width:520px){
     #dc-panel{left:8px;right:8px;bottom:8px;width:auto;border-radius:18px;}
 }
 `;
-
+ 
     // ══════════════════════════════════════════════════════════════════════════════
     //  PANEL BUILD
     // ══════════════════════════════════════════════════════════════════════════════
-
+ 
     let _panel = null,
         _toggle = null,
         _activeTab = "hub";
-
+ 
     const TABS = [{
             id: "hub",
             icon: ICONS.chess,
@@ -1159,7 +1215,7 @@ async function _fetchSession() {
             label: "Settings"
         },
     ];
-
+ 
     const SRC_CLR = {
         correctMoves: {
             bg: "#0b1e0f",
@@ -1182,7 +1238,7 @@ async function _fetchSession() {
             fg: "#c44444"
         },
     };
-
+ 
     // Engine metadata
     const ENGINE_META = {
         stockfish: {
@@ -1209,7 +1265,7 @@ async function _fetchSession() {
     </svg>`,
         },
     };
-
+ 
     // ── TAB: HUB ──────────────────────────────────────────────────────────────────
     function tabHub() {
         const st = BOT_S.status;
@@ -1257,7 +1313,7 @@ async function _fetchSession() {
         </div>
     </div>`;
     }
-
+ 
     // ── TAB: BOT ─────────────────────────────────────────────────────────────────
     function tabBot() {
         const st = BOT_S.status;
@@ -1303,7 +1359,7 @@ async function _fetchSession() {
         <div class="dc-fen">${esc(BOT_S.currentFen)}</div>
     </div>`;
     }
-
+ 
     // ── TAB: SOLVER ───────────────────────────────────────────────────────────────
     function tabSolver() {
         const ch = SOL_STATE.challenges;
@@ -1321,6 +1377,7 @@ async function _fetchSession() {
     </div>
     <div class="dc-card">
         <div class="dc-btn-row">
+            <button class="btn ghost ${SOL_CFG.turbo?"on":""}" id="dc-sol-turbo" title="Skip verify-waits — fires moves at max speed since data is already known-correct">${ICONS.skipall} Turbo</button>
             <button class="btn ghost ${SOL_CFG.flipped?"on":""}" id="dc-sol-flip">${ICONS.flip} Flip Board</button>
             <button class="btn ghost ${SOL_CFG.autoContinue?"on":""}" id="dc-sol-cont">${ICONS.reload} Auto Continue</button>
             <span style="flex:1;display:flex;align-items:center;justify-content:flex-end;font-size:11px;color:rgba(255,255,255,0.2);font-family:'SF Pro Rounded','Nunito',system-ui,sans-serif;">${done} / ${total||0}</span>
@@ -1344,7 +1401,7 @@ async function _fetchSession() {
         }).join("")}</div></div>`
     }`;
     }
-
+ 
     // ── TAB: LOG ──────────────────────────────────────────────────────────────────
     function tabLog() {
         if (!SOL_STATE.log.length) return `<div class="dc-card"><div class="dc-empty">No activity yet</div></div>`;
@@ -1356,17 +1413,17 @@ async function _fetchSession() {
         </div>`).join("");
         return `<div class="dc-card"><div style="padding:8px 10px;">${rows}</div></div>`;
     }
-
+ 
     // ── TAB: SETTINGS ────────────────────────────────────────────────────────────
     function tabCfg() {
         function sw(id, checked) {
             return `<label class="dc-sw"><input type="checkbox" id="${id}"${checked?" checked":""}><div class="dc-sw-t"></div><div class="dc-sw-k"></div></label>`;
         }
-
+ 
         function step(dn, up, val) {
             return `<div class="dc-stepper"><button id="${dn}">−</button><div class="dc-stepper-val" id="${val}">?</div><button id="${up}">+</button></div>`;
         }
-
+ 
         function engBtn(id, meta, isOn, isReady) {
             const icon = meta.iconUrl ?
                 `<img class="dc-eng-icon" src="${meta.iconUrl}" alt="${meta.name}" style="background:rgba(0,0,0,0.3);padding:3px;">` :
@@ -1380,10 +1437,10 @@ async function _fetchSession() {
             <div class="dc-eng-badge ${isReady?"ready":""}"></div>
         </button>`;
         }
-
+ 
         const sfReady = BOT_S.stockfishReady;
         const jceReady = BOT_S.jceReady;
-
+ 
         return `
     <div class="dc-section">
         <div class="dc-section-label">Engine</div>
@@ -1398,7 +1455,7 @@ async function _fetchSession() {
             </div>
         </div>
     </div>
-
+ 
     <div class="dc-section">
         <div class="dc-section-label">Engine Config</div>
         <div class="dc-card">
@@ -1418,7 +1475,7 @@ async function _fetchSession() {
             </div>
         </div>
     </div>
-
+ 
     <div class="dc-section">
         <div class="dc-section-label">Timing (ms)</div>
         <div class="dc-card">
@@ -1436,7 +1493,7 @@ async function _fetchSession() {
             </div>
         </div>
     </div>
-
+ 
     <div class="dc-section">
         <div class="dc-section-label">Misc</div>
         <div class="dc-card">
@@ -1450,7 +1507,7 @@ async function _fetchSession() {
         </div>
     </div>`;
     }
-
+ 
     // ── RENDER ────────────────────────────────────────────────────────────────────
     function renderPanel() {
         if (!_panel) return;
@@ -1458,8 +1515,8 @@ async function _fetchSession() {
         const tabsEl = _panel.querySelector("#dc-tabs");
         const statusEl = _panel.querySelector("#dc-statusbar");
         if (!pane) return;
-
-
+ 
+ 
         // Unlocked — show everything normally
         if (tabsEl) tabsEl.style.display = "";
         if (statusEl) statusEl.style.display = "";
@@ -1479,14 +1536,14 @@ async function _fetchSession() {
         wirePanel();
         updateStatusBar();
     }
-
+ 
     function updateStatusBar() {
         const bar = _panel?.querySelector("#dc-statusbar");
         if (!bar) return;
         const st = BOT_S.status;
         bar.innerHTML = `<span class="dc-status-dot ${st}"></span><span class="dc-status-txt">${esc(st.replace("_"," "))}</span>${BOT_S.lastMove?`<span class="dc-status-move">${esc(BOT_S.lastMove)}</span>`:""}`;
     }
-
+ 
     function wirePanel() {
         const p = _panel;
         const $ = id => p.querySelector("#" + id);
@@ -1500,7 +1557,7 @@ async function _fetchSession() {
                 });
             }
         };
-
+ 
         function step(dn, up, val, obj, key, inc, min, max) {
             const el = $(val);
             if (el) el.textContent = obj[key];
@@ -1517,7 +1574,7 @@ async function _fetchSession() {
                 if (v) v.textContent = obj[key];
             });
         }
-
+ 
         // Hub
         on("dc-h-play", () => {
             BOT_CFG.autoPlay = true;
@@ -1535,7 +1592,7 @@ async function _fetchSession() {
             saveSettings();
             renderPanel();
         });
-
+ 
         // Bot
         on("dc-bot-play", () => {
             BOT_CFG.autoPlay = true;
@@ -1552,7 +1609,7 @@ async function _fetchSession() {
             saveSettings();
             renderPanel();
         });
-
+ 
         // Solver
         on("dc-sol-next", () => {
             if (!SOL_STATE.solving) solveNext().catch(e => addLog("solver", "err: " + e.message));
@@ -1576,7 +1633,7 @@ async function _fetchSession() {
             saveSettings();
             renderPanel();
         });
-
+ 
         // Engine buttons
         p.querySelectorAll(".dc-eng-btn").forEach(btn => {
             btn.addEventListener("click", () => {
@@ -1594,7 +1651,7 @@ async function _fetchSession() {
         on("dc-load-sf", () => {
             loadStockfish().then(() => renderPanel());
         });
-
+ 
         // Settings steppers
         step("dc-jd", "dc-ju", "dc-jv", BOT_CFG, "jceLevel", 1, 0, 4);
         step("dc-sd", "dc-su", "dc-sv", BOT_CFG, "stockfishDepth", 1, 1, 15);
@@ -1602,12 +1659,18 @@ async function _fetchSession() {
         step("dc-bmd", "dc-bmu", "dc-bmv", BOT_CFG, "moveDelay", 100, 100, 5000);
         step("dc-sed", "dc-seu", "dc-sev", SOL_CFG, "enemyDelay", 100, 500, 8000);
         chk("dc-pm", BOT_CFG, "postMoves");
+        on("dc-sol-turbo", () => {
+            SOL_CFG.turbo = !SOL_CFG.turbo;
+            saveSettings();
+            addLog("solver", SOL_CFG.turbo ? "Turbo ON — known-correct moves fire at max speed" : "Turbo OFF — verify-wait mode");
+            renderPanel();
+        });
     }
-
+ 
     // ══════════════════════════════════════════════════════════════════════════════
     //  CREATE PANEL
     // ══════════════════════════════════════════════════════════════════════════════
-
+ 
     function injectCSS() {
         if (document.getElementById("dc-style")) return;
         const s = document.createElement("style");
@@ -1615,20 +1678,20 @@ async function _fetchSession() {
         s.textContent = STYLE;
         document.head.appendChild(s);
     }
-
+ 
     function createPanel() {
         injectCSS();
-
+ 
         if (_panel) {
             _panel.remove();
             _panel = null;
         }
-
+ 
         _panel = document.createElement("div");
         _panel.id = "dc-panel";
-
+ 
         const tabsHTML = TABS.map(t => `<button class="dc-tab${t.id===_activeTab?" on":""}" data-tab="${t.id}">${t.icon} ${t.label}</button>`).join("");
-
+ 
         _panel.innerHTML = `
         <div id="dc-bar">
             <div id="dc-wordmark">
@@ -1641,9 +1704,9 @@ async function _fetchSession() {
         <div id="dc-tabs">${tabsHTML}</div>
         <div id="dc-pane"></div>
         <div id="dc-statusbar" class="dc-status-bar"></div>`;
-
+ 
         document.body.appendChild(_panel);
-
+ 
         $i("dc-minimize")?.addEventListener("click", () => {
             const pane = _panel.querySelector("#dc-pane");
             const tabs = _panel.querySelector("#dc-tabs");
@@ -1653,7 +1716,7 @@ async function _fetchSession() {
             if (tabs) tabs.style.display = hidden ? "" : "none";
             if (bar) bar.style.display = hidden ? "" : "none";
         });
-
+ 
         _panel.querySelectorAll(".dc-tab").forEach(t => t.addEventListener("click", () => {
             if (t.dataset.tab === _activeTab) return;
             const pane = _panel.querySelector("#dc-pane");
@@ -1680,11 +1743,11 @@ async function _fetchSession() {
         makeDraggable(_panel, _panel.querySelector("#dc-bar"));
         renderPanel();
     }
-
+ 
     function $i(id) {
         return _panel?.querySelector("#" + id);
     }
-
+ 
     function makeDraggable(el, handle) {
         let sx = 0,
             sy = 0,
@@ -1711,19 +1774,19 @@ async function _fetchSession() {
             drag = false;
         });
     }
-
+ 
     // ── KEYBOARD ──────────────────────────────────────────────────────────────────
     // (Alt+C toggle removed)
-
+ 
     // ══════════════════════════════════════════════════════════════════════════════
     //  AUTO-PLAY POLLING LOOP
     //  Polls canvas every 600ms — triggers takeTurn when board changes & it's our turn.
     //  Covers WebSocket moves & any API response the fetch hook might miss.
     // ══════════════════════════════════════════════════════════════════════════════
-
+ 
     let _pollHash = null;
     let _pollRunning = false;
-
+ 
     async function _fetchMatchState() {
         if (!BOT_S.matchId) return;
         const uid = location.pathname.match(/\/(\d+)\//)?.[1] ?? "0";
@@ -1739,7 +1802,7 @@ async function _fetchSession() {
             onMatchData(data);
         } catch (_) {}
     }
-
+ 
     async function _autoPollLoop() {
         if (_pollRunning) return;
         _pollRunning = true;
@@ -1767,17 +1830,17 @@ async function _fetchSession() {
             }
         }
     }
-
-
+ 
+ 
     // ══════════════════════════════════════════════════════════════════════════════
-
+ 
     // Manual session inject — call from console: DuoChess.injectSession(data)
     window._dcInjectSession = function(data) {
         processSession(data);
         addLog("solver", "[manual] injected session: " + (data?.challenges?.length ?? "?") + " challenges");
         renderPanel();
     };
-
+ 
     window.DuoChess = {
         solve,
         solveNext,
@@ -1827,11 +1890,11 @@ async function _fetchSession() {
             solver: SOL_CFG
         },
     };
-
+ 
     // ══════════════════════════════════════════════════════════════════════════════
     //  BOOT
     // ══════════════════════════════════════════════════════════════════════════════
-
+ 
     function _boot() {
         loadChessJS();
         loadStockfish();
@@ -1847,8 +1910,8 @@ async function _fetchSession() {
             });
         }
     }
-
+ 
     if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", _boot);
     else _boot();
-
+ 
 })();
